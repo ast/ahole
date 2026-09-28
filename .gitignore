@@ -1,0 +1,12 @@
+/target
+/dist
+
+# direnv
+.direnv/
+
+# Private relay settings, loaded by .envrc. Never commit this.
+.env.local
+
+# nix
+result
+result-*

@@ -1,0 +1,33 @@
+[package]
+name = "ahole"
+version = "0.1.0"
+edition = "2024"
+description = "Send a file or directory to a friend, peer to peer, over iroh"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+indicatif = "0.18.6"
+iroh = "1.2.0"
+iroh-blobs = "0.103.0"
+irpc = "0.17.0"
+futures-buffered = "0.2.11"
+n0-future = "0.3"
+num_cpus = "1.17"
+rand = "0.10"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+# For the binary that gets handed to a friend: one big optimised object, no
+# symbols. Costs build time, saves a third of the size.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
