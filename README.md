@@ -47,6 +47,34 @@ xattr -d com.apple.quarantine ahole
 
 Or build it yourself with `cargo build --release`, which needs no such ritual.
 
+### With Nix
+
+The repository is a flake, so you can run it without installing anything:
+
+```
+nix run github:ast/ahole -- send holiday/
+```
+
+To have it on a NixOS machine for good, take the flake as an input and add its
+overlay, which puts `ahole` in `pkgs`:
+
+```nix
+# flake.nix
+inputs.ahole = {
+  url = "github:ast/ahole";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+
+# in a NixOS module
+nixpkgs.overlays = [ inputs.ahole.overlays.default ];
+environment.systemPackages = [ pkgs.ahole ];
+```
+
+The overlay builds with your system's own nixpkgs, from the committed
+`Cargo.lock`. The `follows` line is optional: it keeps a second nixpkgs, which
+only the dev shell would use, out of your lock file. The flake's own `packages`
+output, and so `nix run`, covers x86_64-linux only.
+
 ## Usage
 
 ```
