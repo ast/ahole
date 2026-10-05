@@ -23,6 +23,7 @@ use iroh_blobs::{
         blobs::{AddPathOptions, AddProgressItem, ImportMode},
     },
     format::collection::Collection,
+    protocol::ChunkRangesSeq,
     provider::events::{
         ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
     },
@@ -38,8 +39,7 @@ use walkdir::WalkDir;
 use crate::{CommonArgs, SendArgs, progress, relay, signals, store};
 
 /// Index 0 of a get request is the hash sequence itself and index 1 the
-/// collection metadata; the files start at 2. Used for the progress bar only —
-/// what counts as sent comes from the provider's own stats.
+/// collection metadata; the files start at 2.
 const FIRST_PAYLOAD_INDEX: u64 = 2;
 
 #[derive(Debug, Error)]
@@ -67,6 +67,11 @@ struct Transfer {
 }
 
 pub async fn run(args: SendArgs, common: &CommonArgs) -> Result<()> {
+    // Listening before there is anything to clean up, so that at no point does
+    // a signal kill us with the scratch store still on disk.
+    let interrupted = signals::interrupted();
+    tokio::pin!(interrupted);
+
     let path = args
         .path
         .canonicalize()
@@ -104,8 +109,21 @@ pub async fn run(args: SendArgs, common: &CommonArgs) -> Result<()> {
     );
 
     let started = Instant::now();
-    let (tag, collection, payload_size) =
-        import(&path, &root, blobs.store(), &mp, args.jobs).await?;
+    // Importing something big takes long enough to change one's mind about it.
+    let imported = tokio::select! {
+        imported = import(&path, &root, blobs.store(), &mp, args.jobs) => imported,
+        () = &mut interrupted => Err(anyhow::anyhow!("interrupted")),
+    };
+    let (tag, collection, payload_size) = match imported {
+        Ok(imported) => imported,
+        Err(err) => {
+            // Nothing is being served yet, so there is no router to close the
+            // store for us, and it has to be closed before `scratch` removes
+            // the directory from under it.
+            let _ = db.shutdown().await;
+            return Err(err);
+        }
+    };
     let import_time = started.elapsed();
 
     let endpoint = relay::bind(
@@ -120,7 +138,11 @@ pub async fn run(args: SendArgs, common: &CommonArgs) -> Result<()> {
 
     // The ticket carries the addresses we have at the time we build it, so it
     // has to wait until we know how we are reachable.
-    if let Err(err) = relay::wait_addressable(router.endpoint(), &common.relay).await {
+    let addressable = tokio::select! {
+        addressable = relay::wait_addressable(router.endpoint(), &common.relay) => addressable,
+        () = &mut interrupted => Err(anyhow::anyhow!("interrupted")),
+    };
+    if let Err(err) = addressable {
         // Shutting the router down also shuts down the store: the blobs
         // protocol handler owns that on our behalf.
         let _ = router.shutdown().await;
@@ -155,7 +177,7 @@ pub async fn run(args: SendArgs, common: &CommonArgs) -> Result<()> {
 
     let transfer = tokio::select! {
         done = done_rx, if !args.serve => done.ok(),
-        () = signals::interrupted() => None,
+        () = &mut interrupted => None,
     };
 
     // Dropping the tag unprotects the data; everything else here is about
@@ -290,7 +312,7 @@ fn entries(path: &Path, root: &Path) -> Result<Vec<(String, PathBuf)>> {
 }
 
 /// Turns provider events into a progress bar, and decides when the transfer is
-/// over: all payload bytes sent, and the peer has hung up (or two seconds have
+/// over: every file sent in full, and the peer has hung up (or two seconds have
 /// passed, in case it hangs around).
 async fn watch_provider(
     mp: MultiProgress,
@@ -298,10 +320,6 @@ async fn watch_provider(
     payload_size: u64,
     done: oneshot::Sender<Transfer>,
 ) {
-    // `payload_bytes_sent` counts the hash sequence and the collection metadata
-    // as payload too, so the total runs a couple of hundred bytes ahead of the
-    // files themselves. That only matters for a transfer smaller than that, and
-    // the peer has those bytes by then anyway.
     let mut peers: HashMap<u64, String> = HashMap::new();
     let mut requests = FuturesUnordered::new();
     let sent = Arc::new(AtomicU64::new(0));
@@ -351,7 +369,8 @@ async fn watch_provider(
                                 pb
                             })
                             .clone();
-                        requests.push(track_request(pb, sent.clone(), msg.rx));
+                        let ranges = msg.request.ranges.clone();
+                        requests.push(track_request(pb, sent.clone(), ranges, msg.rx));
                     }
                     _ => {}
                 }
@@ -382,47 +401,47 @@ async fn watch_provider(
     }
 }
 
-/// Follows one get request: drives the bar while it runs, and adds what really
-/// went out to `sent` when it ends.
+/// Follows one get request: drives the bar while it runs, and adds each file
+/// to `sent` once the provider has sent all of it.
 ///
-/// Only the provider's own stats can say how much was sent. A blob's `size` is
-/// the size of the whole blob even when the peer asked for a single chunk of
-/// it — a receiver starts by probing the last chunk of every file to learn the
-/// sizes, and crediting those probes with whole files would have us believe a
-/// transfer finished before it began.
+/// A file only counts when the request asked for the whole of it. A receiver
+/// starts by probing the last chunk of every file to learn the sizes and then
+/// fetches the two blobs that carry the names, and the provider's stats report
+/// all of that as payload bytes — for a file that fits in one chunk the probe
+/// even hands over the entire file. Counting bytes on the wire would have us
+/// believe a small transfer finished before it began.
 async fn track_request(
     pb: ProgressBar,
     sent: Arc<AtomicU64>,
+    ranges: ChunkRangesSeq,
     mut updates: irpc::channel::mpsc::Receiver<RequestUpdate>,
 ) {
-    // Both are estimates for the bar alone, reset when the request ends.
-    let mut shown = 0;
-    let mut in_flight = 0;
+    // The size of the file going out right now, if it is one that counts.
+    let mut in_flight: Option<u64> = None;
     while let Ok(Some(update)) = updates.recv().await {
         match update {
             RequestUpdate::Started(started) => {
                 debug!(index = started.index, size = started.size, "sending blob");
-                shown += in_flight;
-                in_flight = if started.index >= FIRST_PAYLOAD_INDEX {
-                    started.size
-                } else {
-                    0
-                };
-                pb.set_position(sent.load(Ordering::Relaxed) + shown);
-            }
-            RequestUpdate::Progress(p) => {
-                if in_flight > 0 {
-                    pb.set_position(
-                        sent.load(Ordering::Relaxed) + shown + p.end_offset.min(in_flight),
-                    );
+                // The provider only moves on to the next blob after the last
+                // one went out, so this is also the end of the previous file.
+                sent.fetch_add(in_flight.take().unwrap_or(0), Ordering::Relaxed);
+                if started.index >= FIRST_PAYLOAD_INDEX && ranges[started.index].is_all() {
+                    in_flight = Some(started.size);
                 }
-            }
-            RequestUpdate::Completed(done) => {
-                sent.fetch_add(done.stats.payload_bytes_sent, Ordering::Relaxed);
                 pb.set_position(sent.load(Ordering::Relaxed));
             }
-            RequestUpdate::Aborted(done) => {
-                sent.fetch_add(done.stats.payload_bytes_sent, Ordering::Relaxed);
+            RequestUpdate::Progress(p) => {
+                if let Some(size) = in_flight {
+                    pb.set_position(sent.load(Ordering::Relaxed) + p.end_offset.min(size));
+                }
+            }
+            RequestUpdate::Completed(_) => {
+                sent.fetch_add(in_flight.take().unwrap_or(0), Ordering::Relaxed);
+                pb.set_position(sent.load(Ordering::Relaxed));
+            }
+            RequestUpdate::Aborted(_) => {
+                in_flight = None;
+                pb.set_position(sent.load(Ordering::Relaxed));
             }
         }
     }

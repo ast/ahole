@@ -96,8 +96,9 @@ fn a_directory_makes_the_round_trip() {
     let status = sender.wait().expect("waiting for the sender");
     assert!(status.success(), "the sender should exit cleanly");
 
-    // Neither side may leave its scratch store behind.
-    assert!(!has_scratch(&holiday), "sender left a scratch directory");
+    // Neither side may leave its scratch store behind. The sender keeps its
+    // one beside what it sends, not inside it.
+    assert!(!has_scratch(src.path()), "sender left a scratch directory");
     assert!(
         !has_scratch(dest.path()),
         "receiver left a scratch directory"
@@ -125,12 +126,12 @@ fn a_single_file_keeps_its_name() {
 fn an_existing_file_is_not_clobbered_without_asking() {
     let src = tempfile::tempdir().unwrap();
     let file = src.path().join("notes.txt");
-    // Bigger than one chunk on purpose: a receiver's size probe asks for the
-    // last chunk of every file, and for a file that fits in one chunk that
-    // probe hands over the whole thing — which would let the sender count this
-    // transfer as finished and quit before the second attempt below.
-    let contents = vec![b'n'; 64 * 1024];
-    std::fs::write(&file, &contents).unwrap();
+    // Smaller than one chunk on purpose: a receiver's size probe asks for the
+    // last chunk of every file, and for a file this small that probe hands over
+    // the whole thing. The sender must not take that for a finished transfer
+    // and quit before the second attempt below.
+    let contents = b"notes worth keeping";
+    std::fs::write(&file, contents).unwrap();
 
     let (mut sender, ticket) = start_send(&file);
     let dest = tempfile::tempdir().unwrap();
@@ -169,14 +170,61 @@ fn an_existing_file_is_not_clobbered_without_asking() {
     assert!(sender.wait().unwrap().success());
 }
 
+/// A signal while the sender is still importing has to clean up like any other
+/// way out: that is the slow part, and so the likeliest moment for a ctrl-c.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_import_leaves_no_scratch() {
+    let src = tempfile::tempdir().unwrap();
+    let file = src.path().join("huge.bin");
+    // Sparse, so it costs no disk, but hashing it still takes seconds.
+    std::fs::File::create(&file)
+        .unwrap()
+        .set_len(8 * 1024 * 1024 * 1024)
+        .unwrap();
+
+    let sender = ahole()
+        .arg("send")
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the sender");
+    // The scratch store appearing means the import is about to start.
+    for _ in 0..3000 {
+        if has_scratch(src.path()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(has_scratch(src.path()), "the sender never got going");
+
+    let status = Command::new("kill")
+        .args(["-TERM", &sender.id().to_string()])
+        .status()
+        .expect("running kill");
+    assert!(status.success());
+    let out = sender.wait_with_output().expect("waiting for the sender");
+
+    // No ticket on stdout: the signal arrived during the import, not after it.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("ahole recv "),
+        "the import finished before the signal: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("interrupted"),
+        "the sender should say it was interrupted"
+    );
+    assert!(
+        !has_scratch(src.path()),
+        "the interrupted sender left a scratch directory"
+    );
+}
+
 /// True if the directory holds one of our `.ahole-*` scratch stores.
 fn has_scratch(dir: &Path) -> bool {
-    let parent = if dir.is_dir() {
-        dir
-    } else {
-        dir.parent().unwrap()
-    };
-    std::fs::read_dir(parent)
+    std::fs::read_dir(dir)
         .unwrap()
         .filter_map(Result::ok)
         .any(|e| e.file_name().to_string_lossy().starts_with(".ahole-"))

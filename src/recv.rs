@@ -35,6 +35,9 @@ pub enum NameError {
 }
 
 pub async fn run(args: RecvArgs, common: &CommonArgs) -> Result<()> {
+    // Listening before the scratch store exists; see `signals::interrupted`.
+    let interrupted = signals::interrupted();
+
     std::fs::create_dir_all(&args.to).with_context(|| format!("creating {}", args.to.display()))?;
     let target = args
         .to
@@ -52,7 +55,7 @@ pub async fn run(args: RecvArgs, common: &CommonArgs) -> Result<()> {
     // removed on the way out, and a killed process removes nothing.
     let result = tokio::select! {
         result = fetch(&db, &endpoint, &args, &target, &mp, common.verbose) => result,
-        () = signals::interrupted() => Err(anyhow::anyhow!("interrupted")),
+        () = interrupted => Err(anyhow::anyhow!("interrupted")),
     };
 
     endpoint.close().await;
